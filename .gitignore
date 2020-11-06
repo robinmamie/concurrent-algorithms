@@ -28,3 +28,6 @@
 
 !remote_testing_blank.sh
 !test_blank.sh
+
+# And of course, we do not leak the solution proposed by the TA :)
+solution/
