@@ -1,10 +1,10 @@
 /**
  * @file   tm.c
- * @author Robin Mamie <robin.mamie@epfl.ch>
+ * @author Sébastien Rouault <sebastien.rouault@epfl.ch>
  *
  * @section LICENSE
  *
- * Copyright © 2020 Robin Mamie.
+ * Copyright © 2018-2019 Sébastien Rouault.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -18,19 +18,33 @@
  *
  * @section DESCRIPTION
  *
- * Implementation of your own transaction manager.
- * You can completely rewrite this file (and create more files) as you wish.
- * Only the interface (i.e. exported symbols and semantic) must be preserved.
+ * Lock-based transaction manager implementation used as the reference.
 **/
+
+// Compile-time configuration
+// #define USE_MM_PAUSE
+#define USE_PTHREAD_LOCK
+// #define USE_TICKET_LOCK
+// #define USE_RW_LOCK
 
 // Requested features
 #define _GNU_SOURCE
-#define _POSIX_C_SOURCE   200809L
+#define _POSIX_C_SOURCE 200809L
 #ifdef __STDC_NO_ATOMICS__
-    #error Current C11 compiler does not support atomic operations
+#error Current C11 compiler does not support atomic operations
 #endif
 
 // External headers
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#if (defined(__i386__) || defined(__x86_64__)) && defined(USE_MM_PAUSE)
+#include <xmmintrin.h>
+#else
+#include <sched.h>
+#endif
 
 // Internal headers
 #include <tm.h>
@@ -42,11 +56,11 @@
 **/
 #undef likely
 #ifdef __GNUC__
-    #define likely(prop) \
-        __builtin_expect((prop) ? 1 : 0, 1)
+#define likely(prop) \
+    __builtin_expect((prop) ? 1 : 0, 1)
 #else
-    #define likely(prop) \
-        (prop)
+#define likely(prop) \
+    (prop)
 #endif
 
 /** Define a proposition as likely false.
@@ -54,11 +68,11 @@
 **/
 #undef unlikely
 #ifdef __GNUC__
-    #define unlikely(prop) \
-        __builtin_expect((prop) ? 1 : 0, 0)
+#define unlikely(prop) \
+    __builtin_expect((prop) ? 1 : 0, 0)
 #else
-    #define unlikely(prop) \
-        (prop)
+#define unlikely(prop) \
+    (prop)
 #endif
 
 /** Define one or several attributes.
@@ -66,48 +80,12 @@
 **/
 #undef as
 #ifdef __GNUC__
-    #define as(type...) \
-        __attribute__((type))
+#define as(type...) \
+    __attribute__((type))
 #else
-    #define as(type...)
-    #warning This compiler has no support for GCC attributes
+#define as(type...)
+#warning This compiler has no support for GCC attributes
 #endif
-
-// -------------------------------------------------------------------------- //
-
-typedef int status_t;
-static status_t const active_status   = 0;
-static status_t const aborting_status = 1;
-static status_t const copying_status  = 2;
-
-typedef struct tx_descriptor {
-    status_t status;
-    size_t priority;
-    size_t wait_length;
-    void* writes;
-    void* reads;
-} tx_descriptor;
-
-typedef struct wr_descriptor {
-    size_t last_version;
-    void* object_pointer;
-    void* data_copy;
-} wr_descriptor;
-
-typedef struct rd_descriptor {
-    size_t version_seen;
-    void* object_pointer;
-} rd_descriptor;
-
-typedef struct handle {
-    size_t version;
-    wr_descriptor *wr_descr;
-} handle_t;
-
-static void handle_reset(handle_t* handle) {
-    handle->version = 0;
-    handle->wr_descr = NULL;
-}
 
 // -------------------------------------------------------------------------- //
 
@@ -118,31 +96,30 @@ static void handle_reset(handle_t* handle) {
  * @return Parent pointer
 **/
 #define objectof(ptr, type, member) \
-    ((type*) ((uintptr_t) ptr - offsetof(type, member)))
+    ((type *)((uintptr_t)ptr - offsetof(type, member)))
 
-struct link {
-    struct link* prev; // Previous link in the chain
-    struct link* next; // Next link in the chain
-    handle_t* handle;
+struct link
+{
+    struct link *prev; // Previous link in the chain
+    struct link *next; // Next link in the chain
 };
 
 /** Link reset.
  * @param link Link to reset
 **/
-static void link_reset(struct link* link) {
+static void link_reset(struct link *link)
+{
     link->prev = link;
     link->next = link;
-    link->handle = malloc(sizeof(handle_t));
-    link->handle->version = 0;
-    link->handle->wr_descr = NULL;
 }
 
 /** Link insertion before a "base" link.
  * @param link Link to insert
  * @param base Base link relative to which 'link' will be inserted
 **/
-static void link_insert(struct link* link, struct link* base) {
-    struct link* prev = base->prev;
+static void link_insert(struct link *link, struct link *base)
+{
+    struct link *prev = base->prev;
     link->prev = prev;
     link->next = base;
     base->prev = link;
@@ -152,59 +129,341 @@ static void link_insert(struct link* link, struct link* base) {
 /** Link removal.
  * @param link Link to remove
 **/
-static void link_remove(struct link* link) {
-    struct link* prev = link->prev;
-    struct link* next = link->next;
+static void link_remove(struct link *link)
+{
+    struct link *prev = link->prev;
+    struct link *next = link->next;
     prev->next = next;
     next->prev = prev;
 }
 
 // -------------------------------------------------------------------------- //
 
-static const tx_t read_only_tx  = UINTPTR_MAX - 10;
-static const tx_t read_write_tx = UINTPTR_MAX - 11;
+/** Pause for a very short amount of time.
+**/
+static inline void pause()
+{
+#if (defined(__i386__) || defined(__x86_64__)) && defined(USE_MM_PAUSE)
+    _mm_pause();
+#else
+    sched_yield();
+#endif
+}
 
-struct region {
-    void* start;        // Start of the shared memory region
-    struct link allocs; // Allocated shared memory regions
-    size_t size;        // Size of the shared memory region (in bytes)
-    size_t align;       // Claimed alignment of the shared memory region (in bytes)
-    size_t align_alloc; // Actual alignment of the memory allocations (in bytes)
-    size_t delta_alloc; // Space to add at the beginning of the segment for the link chain (in bytes)
+#if defined(USE_PTHREAD_LOCK)
+
+struct lock_t
+{
+    pthread_mutex_t mutex;
 };
 
-/** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
- * @param size  Size of the first shared segment of memory to allocate (in bytes), must be a positive multiple of the alignment
- * @param align Alignment (in bytes, must be a power of 2) that the shared memory region must support
- * @return Opaque shared memory region handle, 'invalid_shared' on failure
+/** Initialize the given lock.
+ * @param lock Lock to initialize
+ * @return Whether the operation is a success
 **/
-shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
-    struct region* region = (struct region*) malloc(sizeof(struct region));
-    if (unlikely(!region)) {
+static bool lock_init(struct lock_t *lock)
+{
+    return pthread_mutex_init(&(lock->mutex), NULL) == 0;
+}
+
+/** Clean the given lock up.
+ * @param lock Lock to clean up
+**/
+static void lock_cleanup(struct lock_t *lock)
+{
+    pthread_mutex_destroy(&(lock->mutex));
+}
+
+/** Wait and acquire the given lock.
+ * @param lock Lock to acquire
+ * @return Whether the operation is a success
+**/
+static bool lock_acquire(struct lock_t *lock)
+{
+    return pthread_mutex_lock(&(lock->mutex)) == 0;
+}
+
+/** Release the given lock.
+ * @param lock Lock to release
+**/
+static void lock_release(struct lock_t *lock)
+{
+    pthread_mutex_unlock(&(lock->mutex));
+}
+
+static bool lock_acquire_shared(struct lock_t *lock)
+{
+    return lock_acquire(lock);
+}
+
+static void lock_release_shared(struct lock_t *lock)
+{
+    lock_release(lock);
+}
+
+#elif defined(USE_TICKET_LOCK)
+
+struct lock_t
+{
+    atomic_ulong pass; // Ticket that acquires the lock
+    atomic_ulong take; // Ticket the next thread takes
+};
+
+/** Initialize the given lock.
+ * @param lock Lock to initialize
+ * @return Whether the operation is a success
+**/
+static bool lock_init(struct lock_t *lock)
+{
+    atomic_init(&(lock->pass), 0ul);
+    atomic_init(&(lock->take), 0ul);
+    return true;
+}
+
+/** Clean the given lock up.
+ * @param lock Lock to clean up
+**/
+static void lock_cleanup(struct lock_t *lock as(unused))
+{
+    return;
+}
+
+/** Wait and acquire the given lock.
+ * @param lock Lock to acquire
+ * @return Whether the operation is a success
+**/
+static bool lock_acquire(struct lock_t *lock)
+{
+    unsigned long ticket = atomic_fetch_add_explicit(&(lock->take), 1ul, memory_order_relaxed);
+    while (atomic_load_explicit(&(lock->pass), memory_order_relaxed) != ticket)
+        pause();
+    atomic_thread_fence(memory_order_acquire);
+    return true;
+}
+
+/** Release the given lock.
+ * @param lock Lock to release
+**/
+static void lock_release(struct lock_t *lock)
+{
+    atomic_fetch_add_explicit(&(lock->pass), 1, memory_order_release);
+}
+
+static bool lock_acquire_shared(struct lock_t *lock)
+{
+    return lock_acquire(lock);
+}
+
+static void lock_release_shared(struct lock_t *lock)
+{
+    lock_release(lock);
+}
+
+#elif defined(USE_RW_LOCK)
+
+struct lock_t
+{
+    pthread_rwlock_t rwlock;
+};
+
+/** Initialize the given lock.
+ * @param lock Lock to initialize
+ * @return Whether the operation is a success
+**/
+static bool lock_init(struct lock_t *lock)
+{
+    return (0 == pthread_rwlock_init(&lock->rwlock, NULL));
+}
+
+/** Clean the given lock up.
+ * @param lock Lock to clean up
+**/
+static void lock_cleanup(struct lock_t *lock as(unused))
+{
+    pthread_rwlock_destroy(&lock->rwlock);
+}
+
+/** Wait and acquire the given lock.
+ * @param lock Lock to acquire
+ * @return Whether the operation is a success
+**/
+static bool lock_acquire(struct lock_t *lock)
+{
+    return (0 == pthread_rwlock_wrlock(&lock->rwlock));
+}
+
+/** Release the given lock.
+ * @param lock Lock to release
+**/
+static void lock_release(struct lock_t *lock)
+{
+    pthread_rwlock_unlock(&lock->rwlock);
+}
+
+/** Wait and acquire the given lock.
+ * @param lock Lock to acquire
+ * @return Whether the operation is a success
+**/
+static bool lock_acquire_shared(struct lock_t *lock)
+{
+    return (0 == pthread_rwlock_rdlock(&lock->rwlock));
+}
+
+/** Release the given lock.
+ * @param lock Lock to release
+**/
+static void lock_release_shared(struct lock_t *lock)
+{
+    pthread_rwlock_unlock(&lock->rwlock);
+}
+
+#else // Test-and-test-and-set
+
+struct lock_t
+{
+    atomic_bool locked; // Whether the lock is taken
+};
+
+/** Initialize the given lock.
+ * @param lock Lock to initialize
+ * @return Whether the operation is a success
+**/
+static bool lock_init(struct lock_t *lock)
+{
+    atomic_init(&(lock->locked), false);
+    return true;
+}
+
+/** Clean the given lock up.
+ * @param lock Lock to clean up
+**/
+static void lock_cleanup(struct lock_t *lock as(unused))
+{
+    return;
+}
+
+/** Wait and acquire the given lock.
+ * @param lock Lock to acquire
+ * @return Whether the operation is a success
+**/
+static bool lock_acquire(struct lock_t *lock)
+{
+    bool expected = false;
+    while (unlikely(!atomic_compare_exchange_weak_explicit(&(lock->locked), &expected, true, memory_order_acquire, memory_order_relaxed)))
+    {
+        expected = false;
+        while (unlikely(atomic_load_explicit(&(lock->locked), memory_order_relaxed)))
+            pause();
+    }
+    return true;
+}
+
+/** Release the given lock.
+ * @param lock Lock to release
+**/
+static void lock_release(struct lock_t *lock)
+{
+    atomic_store_explicit(&(lock->locked), false, memory_order_release);
+}
+
+static bool lock_acquire_shared(struct lock_t *lock)
+{
+    return lock_acquire(lock);
+}
+
+static void lock_release_shared(struct lock_t *lock)
+{
+    lock_release(lock);
+}
+
+#endif
+
+// -------------------------------------------------------------------------- //
+
+static const tx_t read_only_tx = UINTPTR_MAX - 10;
+static const tx_t read_write_tx = UINTPTR_MAX - 11;
+
+// struct transaction
+// {
+//     bool is_ro;
+//     unsigned long start_timestamp;
+// };
+
+struct region
+{
+    unsigned long ro_operations;
+    pthread_cond_t ro_condition;
+    pthread_cond_t rw_condition;
+    struct lock_t write_lock; // Global write lock
+    struct lock_t meta_lock;  // Global write lock
+    void *start;              // Start of the shared memory region
+    struct link allocs;       // Allocated shared memory regions
+    size_t size;              // Size of the shared memory region (in bytes)
+    size_t align;             // Claimed alignment of the shared memory region (in bytes)
+    size_t align_alloc;       // Actual alignment of the memory allocations (in bytes)
+    size_t delta_alloc;       // Space to add at the beginning of the segment for the link chain (in bytes)
+};
+
+shared_t tm_create(size_t size, size_t align)
+{
+    struct region *region = (struct region *)malloc(sizeof(struct region));
+    if (unlikely(!region))
+    {
         return invalid_shared;
     }
-    size_t align_alloc = align < sizeof(void*) ? sizeof(void*) : align; // Also satisfy alignment requirement of 'struct link'
-    if (unlikely(posix_memalign(&(region->start), align_alloc, size) != 0)) {
+    size_t align_alloc = align < sizeof(void *) ? sizeof(void *) : align; // Also satisfy alignment requirement of 'struct link'
+    if (unlikely(posix_memalign(&(region->start), align_alloc, size) != 0))
+    {
         free(region);
+        return invalid_shared;
+    }
+    if (unlikely(!lock_init(&(region->write_lock))))
+    {
+        free(region->start);
+        free(region);
+        return invalid_shared;
+    }
+    if (unlikely(!lock_init(&(region->meta_lock))))
+    {
+        free(region->start);
+        free(region);
+        lock_cleanup(&(region->write_lock));
+        return invalid_shared;
+    }
+    if (pthread_cond_init(&(region->ro_condition), NULL) != 0)
+    {
+        free(region->start);
+        free(region);
+        lock_cleanup(&(region->write_lock));
+        lock_cleanup(&(region->meta_lock));
+        return invalid_shared;
+    }
+    if (pthread_cond_init(&(region->rw_condition), NULL) != 0)
+    {
+        free(region->start);
+        free(region);
+        lock_cleanup(&(region->write_lock));
+        lock_cleanup(&(region->meta_lock));
+        pthread_cond_destroy(&(region->ro_condition));
         return invalid_shared;
     }
     memset(region->start, 0, size);
     link_reset(&(region->allocs));
-    region->size        = size;
-    region->align       = align;
+    region->ro_operations = 0;
+    region->size = size;
+    region->align = align;
     region->align_alloc = align_alloc;
     region->delta_alloc = (sizeof(struct link) + align_alloc - 1) / align_alloc * align_alloc;
     return region;
 }
 
-/** Destroy (i.e. clean-up + free) a given shared memory region.
- * @param shared Shared memory region to destroy, with no running transaction
-**/
-void tm_destroy(shared_t shared as(unused)) {
-    struct region* region = (struct region*) shared;
-    struct link* allocs = &(region->allocs);
-    while (true) { // Free allocated segments
-        struct link* alloc = allocs->next;
+void tm_destroy(shared_t shared)
+{
+    struct region *region = (struct region *)shared;
+    struct link *allocs = &(region->allocs);
+    while (true)
+    { // Free allocated segments
+        struct link *alloc = allocs->next;
         if (alloc == allocs)
             break;
         link_remove(alloc);
@@ -212,116 +471,106 @@ void tm_destroy(shared_t shared as(unused)) {
     }
     free(region->start);
     free(region);
+    lock_cleanup(&(region->write_lock));
+    lock_cleanup(&(region->meta_lock));
+    pthread_cond_destroy(&(region->ro_condition));
+    pthread_cond_destroy(&(region->rw_condition));
 }
 
-/** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
- * @param shared Shared memory region to query
- * @return Start address of the first allocated segment
-**/
-void* tm_start(shared_t shared as(unused)) {
-    return ((struct region*) shared)->start;
+void *tm_start(shared_t shared)
+{
+    return ((struct region *)shared)->start;
 }
 
-/** [thread-safe] Return the size (in bytes) of the first allocated segment of the shared memory region.
- * @param shared Shared memory region to query
- * @return First allocated segment size
-**/
-size_t tm_size(shared_t shared as(unused)) {
-    return ((struct region*) shared)->size;
+size_t tm_size(shared_t shared)
+{
+    return ((struct region *)shared)->size;
 }
 
-/** [thread-safe] Return the alignment (in bytes) of the memory accesses on the given shared memory region.
- * @param shared Shared memory region to query
- * @return Alignment used globally
-**/
-size_t tm_align(shared_t shared as(unused)) {
-    return ((struct region*) shared)->align;
+size_t tm_align(shared_t shared)
+{
+    return ((struct region *)shared)->align;
 }
 
-/** [thread-safe] Begin a new transaction on the given shared memory region.
- * @param shared Shared memory region to start a transaction on
- * @param is_ro  Whether the transaction is read-only
- * @return Opaque transaction ID, 'invalid_tx' on failure
-**/
-tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
-    if (is_ro) {
-        if (NULL)
-            return invalid_tx;
+tx_t tm_begin(shared_t shared, bool is_ro)
+{
+    struct region *region = (struct region *)shared;
+    lock_acquire(&(region->meta_lock));
+    if (is_ro)
+    {
+        while (unlikely(!lock_acquire_shared(&(region->write_lock))))
+        {
+            pthread_cond_wait(&(region->rw_condition), &(region->meta_lock.mutex));
+        }
+        region->ro_operations += 1UL;
+        lock_release(&(region->meta_lock));
+        lock_release_shared(&(region->write_lock));
         return read_only_tx;
-    } else {
-        if (NULL)
-            return invalid_tx;
+    }
+    else
+    {
+        while (region->ro_operations != 0UL)
+        {
+            pthread_cond_wait(&(region->ro_condition), &(region->meta_lock.mutex));
+        }
+        lock_acquire(&(region->write_lock));
+        lock_release_shared(&(region->meta_lock));
         return read_write_tx;
     }
-    return invalid_tx;
 }
 
-/** [thread-safe] End the given transaction.
- * @param shared Shared memory region associated with the transaction
- * @param tx     Transaction to end
- * @return Whether the whole transaction committed
-**/
-bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
-    // TODO commit transaction
-    return false;
+bool tm_end(shared_t shared, tx_t tx)
+{
+    struct region *region = (struct region *)shared;
+    if (tx == read_only_tx)
+    {
+        lock_acquire(&(region->meta_lock));
+        region->ro_operations -= 1UL;
+        pthread_cond_broadcast(&(region->ro_condition));
+        lock_release(&(region->meta_lock));
+    }
+    else
+    {
+        lock_release(&(region->write_lock));
+        lock_acquire(&(region->meta_lock));
+        pthread_cond_broadcast(&(region->rw_condition));
+        lock_release(&(region->meta_lock));
+    }
+    return true;
 }
 
-/** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
- * @param shared Shared memory region associated with the transaction
- * @param tx     Transaction to use
- * @param source Source start address (in the shared region)
- * @param size   Length to copy (in bytes), must be a positive multiple of the alignment
- * @param target Target start address (in a private region)
- * @return Whether the whole transaction can continue
-**/
-bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source as(unused), size_t size as(unused), void* target as(unused)) {
+bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const *source, size_t size, void *target)
+{
     memcpy(target, source, size);
     return true;
 }
 
-/** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
- * @param shared Shared memory region associated with the transaction
- * @param tx     Transaction to use
- * @param source Source start address (in a private region)
- * @param size   Length to copy (in bytes), must be a positive multiple of the alignment
- * @param target Target start address (in the shared region)
- * @return Whether the whole transaction can continue
-**/
-bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const* source as(unused), size_t size as(unused), void* target as(unused)) {
+bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source, size_t size, void *target)
+{
     memcpy(target, source, size);
+    //atomic_fetch_add_explicit(&(region->timestamp), 1UL, memory_order_release);
     return true;
 }
 
-/** [thread-safe] Memory allocation in the given transaction.
- * @param shared Shared memory region associated with the transaction
- * @param tx     Transaction to use
- * @param size   Allocation requested size (in bytes), must be a positive multiple of the alignment
- * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
- * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
-**/
-alloc_t tm_alloc(shared_t shared as(unused), tx_t tx as(unused), size_t size as(unused), void** target as(unused)) {
-    size_t align_alloc = ((struct region*) shared)->align_alloc;
-    size_t delta_alloc = ((struct region*) shared)->delta_alloc;
-    void* segment;
+alloc_t tm_alloc(shared_t shared, tx_t tx as(unused), size_t size, void **target)
+{
+    size_t align_alloc = ((struct region *)shared)->align_alloc;
+    size_t delta_alloc = ((struct region *)shared)->delta_alloc;
+    void *segment;
     if (unlikely(posix_memalign(&segment, align_alloc, delta_alloc + size) != 0)) // Allocation failed
         return nomem_alloc;
-    link_insert((struct link*) segment, &(((struct region*) shared)->allocs));
-    segment = (void*) ((uintptr_t) segment + delta_alloc);
+    link_insert((struct link *)segment, &(((struct region *)shared)->allocs));
+    segment = (void *)((uintptr_t)segment + delta_alloc);
     memset(segment, 0, size);
     *target = segment;
     return success_alloc;
 }
 
-/** [thread-safe] Memory freeing in the given transaction.
- * @param shared Shared memory region associated with the transaction
- * @param tx     Transaction to use
- * @param target Address of the first byte of the previously allocated segment to deallocate
- * @return Whether the whole transaction can continue
-**/
-bool tm_free(shared_t shared as(unused), tx_t tx as(unused), void* target as(unused)) {
-    size_t delta_alloc = ((struct region*) shared)->delta_alloc;
-    target = (void*) ((uintptr_t) target - delta_alloc);
-    link_remove((struct link*) target);
-    free(target);
+bool tm_free(shared_t shared, tx_t tx as(unused), void *segment)
+{
+    size_t delta_alloc = ((struct region *)shared)->delta_alloc;
+    segment = (void *)((uintptr_t)segment - delta_alloc);
+    link_remove((struct link *)segment);
+    free(segment);
     return true;
 }
