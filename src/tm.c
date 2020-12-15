@@ -1,10 +1,10 @@
 /**
  * @file   tm.c
- * @author Sébastien Rouault <sebastien.rouault@epfl.ch>
+ * @author Robin Mamie <robin.mamie@epfl.ch>
  *
  * @section LICENSE
  *
- * Copyright © 2018-2019 Sébastien Rouault.
+ * Copyright © 2018-2019 Robin Mamie.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -22,11 +22,6 @@
 **/
 
 // Compile-time configuration
-// #define USE_MM_PAUSE
-#define USE_PTHREAD_LOCK
-// #define USE_TICKET_LOCK
-// #define USE_RW_LOCK
-
 // Requested features
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
@@ -150,11 +145,10 @@ static inline void pause()
 #endif
 }
 
-#if defined(USE_PTHREAD_LOCK)
-
 struct lock_t
 {
     pthread_mutex_t mutex;
+    pthread_cond_t cond;
 };
 
 /** Initialize the given lock.
@@ -163,7 +157,16 @@ struct lock_t
 **/
 static bool lock_init(struct lock_t *lock)
 {
-    return pthread_mutex_init(&(lock->mutex), NULL) == 0;
+    if (pthread_cond_init(&(lock->cond), NULL) != 0)
+    {
+        return false;
+    }
+    if (pthread_mutex_init(&(lock->mutex), NULL) != 0)
+    {
+        pthread_cond_destroy(&(lock->cond));
+        return false;
+    }
+    return true;
 }
 
 /** Clean the given lock up.
@@ -172,6 +175,7 @@ static bool lock_init(struct lock_t *lock)
 static void lock_cleanup(struct lock_t *lock)
 {
     pthread_mutex_destroy(&(lock->mutex));
+    pthread_cond_destroy(&(lock->cond));
 }
 
 /** Wait and acquire the given lock.
@@ -191,217 +195,33 @@ static void lock_release(struct lock_t *lock)
     pthread_mutex_unlock(&(lock->mutex));
 }
 
-static bool lock_acquire_shared(struct lock_t *lock)
+static void lock_broadcast(struct lock_t *lock)
 {
-    return lock_acquire(lock);
+    pthread_cond_broadcast(&(lock->cond));
 }
 
-static void lock_release_shared(struct lock_t *lock)
+static void lock_wait(struct lock_t *lock)
 {
-    lock_release(lock);
+    pthread_cond_wait(&(lock->cond), &(lock->mutex));
 }
-
-#elif defined(USE_TICKET_LOCK)
-
-struct lock_t
-{
-    atomic_ulong pass; // Ticket that acquires the lock
-    atomic_ulong take; // Ticket the next thread takes
-};
-
-/** Initialize the given lock.
- * @param lock Lock to initialize
- * @return Whether the operation is a success
-**/
-static bool lock_init(struct lock_t *lock)
-{
-    atomic_init(&(lock->pass), 0ul);
-    atomic_init(&(lock->take), 0ul);
-    return true;
-}
-
-/** Clean the given lock up.
- * @param lock Lock to clean up
-**/
-static void lock_cleanup(struct lock_t *lock as(unused))
-{
-    return;
-}
-
-/** Wait and acquire the given lock.
- * @param lock Lock to acquire
- * @return Whether the operation is a success
-**/
-static bool lock_acquire(struct lock_t *lock)
-{
-    unsigned long ticket = atomic_fetch_add_explicit(&(lock->take), 1ul, memory_order_relaxed);
-    while (atomic_load_explicit(&(lock->pass), memory_order_relaxed) != ticket)
-        pause();
-    atomic_thread_fence(memory_order_acquire);
-    return true;
-}
-
-/** Release the given lock.
- * @param lock Lock to release
-**/
-static void lock_release(struct lock_t *lock)
-{
-    atomic_fetch_add_explicit(&(lock->pass), 1, memory_order_release);
-}
-
-static bool lock_acquire_shared(struct lock_t *lock)
-{
-    return lock_acquire(lock);
-}
-
-static void lock_release_shared(struct lock_t *lock)
-{
-    lock_release(lock);
-}
-
-#elif defined(USE_RW_LOCK)
-
-struct lock_t
-{
-    pthread_rwlock_t rwlock;
-};
-
-/** Initialize the given lock.
- * @param lock Lock to initialize
- * @return Whether the operation is a success
-**/
-static bool lock_init(struct lock_t *lock)
-{
-    return (0 == pthread_rwlock_init(&lock->rwlock, NULL));
-}
-
-/** Clean the given lock up.
- * @param lock Lock to clean up
-**/
-static void lock_cleanup(struct lock_t *lock as(unused))
-{
-    pthread_rwlock_destroy(&lock->rwlock);
-}
-
-/** Wait and acquire the given lock.
- * @param lock Lock to acquire
- * @return Whether the operation is a success
-**/
-static bool lock_acquire(struct lock_t *lock)
-{
-    return (0 == pthread_rwlock_wrlock(&lock->rwlock));
-}
-
-/** Release the given lock.
- * @param lock Lock to release
-**/
-static void lock_release(struct lock_t *lock)
-{
-    pthread_rwlock_unlock(&lock->rwlock);
-}
-
-/** Wait and acquire the given lock.
- * @param lock Lock to acquire
- * @return Whether the operation is a success
-**/
-static bool lock_acquire_shared(struct lock_t *lock)
-{
-    return (0 == pthread_rwlock_rdlock(&lock->rwlock));
-}
-
-/** Release the given lock.
- * @param lock Lock to release
-**/
-static void lock_release_shared(struct lock_t *lock)
-{
-    pthread_rwlock_unlock(&lock->rwlock);
-}
-
-#else // Test-and-test-and-set
-
-struct lock_t
-{
-    atomic_bool locked; // Whether the lock is taken
-};
-
-/** Initialize the given lock.
- * @param lock Lock to initialize
- * @return Whether the operation is a success
-**/
-static bool lock_init(struct lock_t *lock)
-{
-    atomic_init(&(lock->locked), false);
-    return true;
-}
-
-/** Clean the given lock up.
- * @param lock Lock to clean up
-**/
-static void lock_cleanup(struct lock_t *lock as(unused))
-{
-    return;
-}
-
-/** Wait and acquire the given lock.
- * @param lock Lock to acquire
- * @return Whether the operation is a success
-**/
-static bool lock_acquire(struct lock_t *lock)
-{
-    bool expected = false;
-    while (unlikely(!atomic_compare_exchange_weak_explicit(&(lock->locked), &expected, true, memory_order_acquire, memory_order_relaxed)))
-    {
-        expected = false;
-        while (unlikely(atomic_load_explicit(&(lock->locked), memory_order_relaxed)))
-            pause();
-    }
-    return true;
-}
-
-/** Release the given lock.
- * @param lock Lock to release
-**/
-static void lock_release(struct lock_t *lock)
-{
-    atomic_store_explicit(&(lock->locked), false, memory_order_release);
-}
-
-static bool lock_acquire_shared(struct lock_t *lock)
-{
-    return lock_acquire(lock);
-}
-
-static void lock_release_shared(struct lock_t *lock)
-{
-    lock_release(lock);
-}
-
-#endif
 
 // -------------------------------------------------------------------------- //
 
 static const tx_t read_only_tx = UINTPTR_MAX - 10;
 static const tx_t read_write_tx = UINTPTR_MAX - 11;
 
-// struct transaction
-// {
-//     bool is_ro;
-//     unsigned long start_timestamp;
-// };
-
 struct region
 {
-    unsigned long ro_operations;
-    pthread_cond_t ro_condition;
-    pthread_cond_t rw_condition;
-    struct lock_t write_lock; // Global write lock
-    struct lock_t meta_lock;  // Global write lock
-    void *start;              // Start of the shared memory region
-    struct link allocs;       // Allocated shared memory regions
-    size_t size;              // Size of the shared memory region (in bytes)
-    size_t align;             // Claimed alignment of the shared memory region (in bytes)
-    size_t align_alloc;       // Actual alignment of the memory allocations (in bytes)
-    size_t delta_alloc;       // Space to add at the beginning of the segment for the link chain (in bytes)
+    unsigned long nb_ro_transactions; // Number of currently executing read-only transactions
+    unsigned long nb_rw_transactions; // Number of currently executing read-write transactions
+    struct lock_t write_lock;         // Global write lock
+    struct lock_t metadata_lock;      // Global write lock
+    void *start;                      // Start of the shared memory region
+    struct link allocs;               // Allocated shared memory regions
+    size_t size;                      // Size of the shared memory region (in bytes)
+    size_t align;                     // Claimed alignment of the shared memory region (in bytes)
+    size_t align_alloc;               // Actual alignment of the memory allocations (in bytes)
+    size_t delta_alloc;               // Space to add at the beginning of the segment for the link chain (in bytes)
 };
 
 shared_t tm_create(size_t size, size_t align)
@@ -423,33 +243,17 @@ shared_t tm_create(size_t size, size_t align)
         free(region);
         return invalid_shared;
     }
-    if (unlikely(!lock_init(&(region->meta_lock))))
+    if (unlikely(!lock_init(&(region->metadata_lock))))
     {
         free(region->start);
         free(region);
         lock_cleanup(&(region->write_lock));
-        return invalid_shared;
-    }
-    if (pthread_cond_init(&(region->ro_condition), NULL) != 0)
-    {
-        free(region->start);
-        free(region);
-        lock_cleanup(&(region->write_lock));
-        lock_cleanup(&(region->meta_lock));
-        return invalid_shared;
-    }
-    if (pthread_cond_init(&(region->rw_condition), NULL) != 0)
-    {
-        free(region->start);
-        free(region);
-        lock_cleanup(&(region->write_lock));
-        lock_cleanup(&(region->meta_lock));
-        pthread_cond_destroy(&(region->ro_condition));
         return invalid_shared;
     }
     memset(region->start, 0, size);
     link_reset(&(region->allocs));
-    region->ro_operations = 0;
+    region->nb_ro_transactions = 0;
+    region->nb_rw_transactions = 0;
     region->size = size;
     region->align = align;
     region->align_alloc = align_alloc;
@@ -472,9 +276,7 @@ void tm_destroy(shared_t shared)
     free(region->start);
     free(region);
     lock_cleanup(&(region->write_lock));
-    lock_cleanup(&(region->meta_lock));
-    pthread_cond_destroy(&(region->ro_condition));
-    pthread_cond_destroy(&(region->rw_condition));
+    lock_cleanup(&(region->metadata_lock));
 }
 
 void *tm_start(shared_t shared)
@@ -495,26 +297,26 @@ size_t tm_align(shared_t shared)
 tx_t tm_begin(shared_t shared, bool is_ro)
 {
     struct region *region = (struct region *)shared;
-    lock_acquire(&(region->meta_lock));
+    lock_acquire(&(region->metadata_lock));
     if (is_ro)
     {
-        while (unlikely(!lock_acquire_shared(&(region->write_lock))))
+        while (region->nb_rw_transactions != 0UL)
         {
-            pthread_cond_wait(&(region->rw_condition), &(region->meta_lock.mutex));
+            lock_wait(&(region->metadata_lock));
         }
-        region->ro_operations += 1UL;
-        lock_release(&(region->meta_lock));
-        lock_release_shared(&(region->write_lock));
+        region->nb_ro_transactions += 1UL;
+        lock_release(&(region->metadata_lock));
         return read_only_tx;
     }
     else
     {
-        while (region->ro_operations != 0UL)
+        while (region->nb_ro_transactions != 0UL)
         {
-            pthread_cond_wait(&(region->ro_condition), &(region->meta_lock.mutex));
+            lock_wait(&(region->metadata_lock));
         }
+        region->nb_rw_transactions += 1UL;
+        lock_release(&(region->metadata_lock));
         lock_acquire(&(region->write_lock));
-        lock_release_shared(&(region->meta_lock));
         return read_write_tx;
     }
 }
@@ -524,17 +326,18 @@ bool tm_end(shared_t shared, tx_t tx)
     struct region *region = (struct region *)shared;
     if (tx == read_only_tx)
     {
-        lock_acquire(&(region->meta_lock));
-        region->ro_operations -= 1UL;
-        pthread_cond_broadcast(&(region->ro_condition));
-        lock_release(&(region->meta_lock));
+        lock_acquire(&(region->metadata_lock));
+        region->nb_ro_transactions -= 1UL;
+        lock_broadcast(&(region->metadata_lock));
+        lock_release(&(region->metadata_lock));
     }
     else
     {
         lock_release(&(region->write_lock));
-        lock_acquire(&(region->meta_lock));
-        pthread_cond_broadcast(&(region->rw_condition));
-        lock_release(&(region->meta_lock));
+        lock_acquire(&(region->metadata_lock));
+        region->nb_rw_transactions -= 1UL;
+        lock_broadcast(&(region->metadata_lock));
+        lock_release(&(region->metadata_lock));
     }
     return true;
 }
@@ -548,7 +351,6 @@ bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const *source,
 bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source, size_t size, void *target)
 {
     memcpy(target, source, size);
-    //atomic_fetch_add_explicit(&(region->timestamp), 1UL, memory_order_release);
     return true;
 }
 
