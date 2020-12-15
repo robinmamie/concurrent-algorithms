@@ -327,16 +327,16 @@ bool tm_end(shared_t shared, tx_t tx)
     if (tx == read_only_tx)
     {
         lock_acquire(&(region->metadata_lock));
-        region->nb_ro_transactions -= 1UL;
         lock_broadcast(&(region->metadata_lock));
+        region->nb_ro_transactions -= 1UL;
         lock_release(&(region->metadata_lock));
     }
     else
     {
         lock_release(&(region->write_lock));
         lock_acquire(&(region->metadata_lock));
-        region->nb_rw_transactions -= 1UL;
         lock_broadcast(&(region->metadata_lock));
+        region->nb_rw_transactions -= 1UL;
         lock_release(&(region->metadata_lock));
     }
     return true;
